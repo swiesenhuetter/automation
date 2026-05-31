@@ -181,6 +181,31 @@ class WaferViewMode(Enum):
     SIDE_SLOT = auto()  # flat slab (parked in cassette slot)
 
 
+class LocationType(Enum):
+    STATION = auto()   # Single-slot stations (Aligner, Exposure Box)
+    SLOT = auto()      # Cassette slots
+    EFFECTOR = auto()  # Robot arms
+
+
+@dataclass(frozen=True)
+class Location:
+    type: LocationType
+    name: str = ""
+    index: int = 0
+
+    @classmethod
+    def station(cls, name: str):
+        return cls(LocationType.STATION, name)
+
+    @classmethod
+    def slot(cls, name: str, index: int):
+        return cls(LocationType.SLOT, name, index)
+
+    @classmethod
+    def effector(cls, index: int):
+        return cls(LocationType.EFFECTOR, "Robot", index)
+
+
 # ---------- DOMAIN MODEL (no Qt graphics) ----------
 
 @dataclass
@@ -234,7 +259,7 @@ class Mask:
 @dataclass
 class Wafer:
     id: str
-    location: str = ""   # "<station>", "Cassette:<slot>", or "Robot:<effector>"
+    location: Location | None = None
 
 
 class MachineController(QObject):
@@ -284,15 +309,15 @@ class MachineController(QObject):
         loc = wafer.location
         if not loc:
             return
-        if loc.startswith("Cassette:"):
-            slot = int(loc.split(":", 1)[1])
+        if loc.type == LocationType.SLOT:
             cassette = self._cassette()
-            if 0 <= slot < cassette.slot_count and cassette.slots[slot] == wafer.id:
-                cassette.slots[slot] = None
-        elif loc.startswith("Robot:"):
+            if 0 <= loc.index < cassette.slot_count and cassette.slots[loc.index] == wafer.id:
+                cassette.slots[loc.index] = None
+        elif loc.type == LocationType.EFFECTOR:
             pass  # robot effectors are tracked by the visualizer
-        elif self.station_holder.get(loc) == wafer.id:
-            self.station_holder[loc] = None
+        elif loc.type == LocationType.STATION:
+            if self.station_holder.get(loc.name) == wafer.id:
+                self.station_holder[loc.name] = None
 
     # ---- mutators ----
 
@@ -302,7 +327,7 @@ class MachineController(QObject):
         assert cassette.slots[slot_index] is None, (
             f"slot {slot_index} already holds {cassette.slots[slot_index]!r}"
         )
-        wafer = Wafer(id=wafer_id, location=f"Cassette:{slot_index}")
+        wafer = Wafer(id=wafer_id, location=Location.slot("Cassette", slot_index))
         self.wafers[wafer_id] = wafer
         cassette.slots[slot_index] = wafer_id
         self.wafer_added.emit(wafer)
@@ -315,10 +340,10 @@ class MachineController(QObject):
             return
         self._release(wafer)
         if isinstance(station, Cassette):
-            wafer.location = f"{destination}:0"
+            wafer.location = Location.slot(destination, 0)
             station.slots[0] = wafer.id
         else:
-            wafer.location = destination
+            wafer.location = Location.station(destination)
             self.station_holder[destination] = wafer.id
         self.wafer_moved.emit(wafer)
 
@@ -328,7 +353,7 @@ class MachineController(QObject):
         if wafer is None or not isinstance(cassette, Cassette):
             return
         self._release(wafer)
-        wafer.location = f"Cassette:{slot_index}"
+        wafer.location = Location.slot("Cassette", slot_index)
         cassette.slots[slot_index] = wafer.id
         self.wafer_moved.emit(wafer)
 
@@ -337,13 +362,14 @@ class MachineController(QObject):
         if wafer is None:
             return
         self._release(wafer)
-        wafer.location = f"Robot:{effector_index}"
+        wafer.location = Location.effector(effector_index)
         self.wafer_moved.emit(wafer)
 
     def free_effectors(self) -> list[int]:
         occupied = {
-            int(w.location.split(":", 1)[1])
-            for w in self.wafers.values() if w.location.startswith("Robot:")
+            w.location.index
+            for w in self.wafers.values()
+            if w.location and w.location.type == LocationType.EFFECTOR
         }
         return [i for i in range(EFFECTOR_COUNT) if i not in occupied]
 
@@ -625,7 +651,7 @@ class WaferVisualizer(QGraphicsView):
         self._effector_wafers: list[WaferItem | None] = [None] * EFFECTOR_COUNT
 
         # Robot serves one move at a time. Snapshot target location at queue time.
-        self._move_queue: list[tuple[Wafer, str]] = []
+        self._move_queue: list[tuple[Wafer, Location]] = []
         self._busy = False
         self._current_seq: QSequentialAnimationGroup | None = None
         self._current_wafer: Wafer | None = None
@@ -723,7 +749,7 @@ class WaferVisualizer(QGraphicsView):
                                  on_arrived=lambda: self._attach(item, target_effector))
 
         # ---- drop phase (only if destination is a station, not the robot) ----
-        if not target_location.startswith("Robot:"):
+        if target_location.type != LocationType.EFFECTOR:
             self._add_reach_legs(seq, target_effector, target_pos,
                                  on_arrived=lambda: self._deliver(item, target_mode, target_effector))
 
@@ -770,11 +796,11 @@ class WaferVisualizer(QGraphicsView):
                 return i
         return None
 
-    def _pick_effector(self, item: WaferItem, target_location: str,
+    def _pick_effector(self, item: WaferItem, target_location: Location,
                        source_effector: int | None) -> int | None:
         """Return the effector to use for this move, or None if not feasible."""
-        if target_location.startswith("Robot:"):
-            dest_e = int(target_location.split(":", 1)[1])
+        if target_location.type == LocationType.EFFECTOR:
+            dest_e = target_location.index
             if source_effector is not None and source_effector != dest_e:
                 return None  # can't move between effectors (they share rotation)
             if source_effector is None and self._effector_wafers[dest_e] is not None:
@@ -813,19 +839,20 @@ class WaferVisualizer(QGraphicsView):
 
     # ---- location resolution ----
 
-    def _resolve(self, location: str) -> tuple[QPointF, WaferViewMode]:
-        if location.startswith("Cassette:"):
-            slot = int(location.split(":", 1)[1])
-            cassette = self.controller.stations["Cassette"]
-            assert isinstance(cassette, Cassette)
-            return cassette.slot_pos(slot), WaferViewMode.SIDE_SLOT
-        if location.startswith("Robot:"):
-            effector = int(location.split(":", 1)[1])
+    def _resolve(self, location: Location) -> tuple[QPointF, WaferViewMode]:
+        if not location:
+            return QPointF(0, 0), WaferViewMode.TOP_DOWN
+        if location.type == LocationType.SLOT:
+            cassette = self.controller.stations.get(location.name)
+            if isinstance(cassette, Cassette):
+                return cassette.slot_pos(location.index), WaferViewMode.SIDE_SLOT
+        if location.type == LocationType.EFFECTOR:
             assert self.robot is not None
-            return self.robot.tip_pos(effector), WaferViewMode.TOP_DOWN
-        station = self.controller.stations.get(location)
-        if station is not None:
-            return station.pos, WaferViewMode.TOP_DOWN
+            return self.robot.tip_pos(location.index), WaferViewMode.TOP_DOWN
+        if location.type == LocationType.STATION:
+            station = self.controller.stations.get(location.name)
+            if station is not None:
+                return station.pos, WaferViewMode.TOP_DOWN
         return QPointF(0, 0), WaferViewMode.TOP_DOWN
 
 
