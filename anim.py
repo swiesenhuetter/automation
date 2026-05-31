@@ -1,6 +1,6 @@
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from PySide6.QtCore import (
     QObject, Signal, QPointF, QPropertyAnimation, QEasingCurve,
@@ -194,6 +194,13 @@ class Station:
 @dataclass
 class Cassette(Station):
     slot_count: int = CASSETTE_SLOT_COUNT
+    # `slots[i]` is the wafer id currently sitting in slot i, or None.
+    # The model owns this; the visualizer and ProcessRunner only read it.
+    slots: list[str | None] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.slots:
+            self.slots = [None] * self.slot_count
 
     def slot_pos(self, slot_index: int) -> QPointF:
         pitch = self.height / self.slot_count
@@ -257,11 +264,47 @@ class MachineController(QObject):
             "Cassette": Cassette("Cassette", CASSETTE_POS, *CASSETTE_SIZE),
             "Aligner": Station("Aligner", ALIGNER_POS, *ALIGNER_SIZE),
         }
+        # Station occupancy: which wafer (if any) currently holds each
+        # single-slot station. The cassette is not in here because its
+        # slots are tracked separately on the Cassette itself.
+        self.station_holder: dict[str, str | None] = {
+            name: None for name, st in self.stations.items() if not isinstance(st, Cassette)
+        }
         self.wafers: dict[str, Wafer] = {}
 
+    # ---- model invariants ----
+
+    def _cassette(self) -> Cassette:
+        cassette = self.stations["Cassette"]
+        assert isinstance(cassette, Cassette)
+        return cassette
+
+    def _release(self, wafer: Wafer):
+        """Clear whatever station/slot this wafer currently holds."""
+        loc = wafer.location
+        if not loc:
+            return
+        if loc.startswith("Cassette:"):
+            slot = int(loc.split(":", 1)[1])
+            cassette = self._cassette()
+            if 0 <= slot < cassette.slot_count and cassette.slots[slot] == wafer.id:
+                cassette.slots[slot] = None
+        elif loc.startswith("Robot:"):
+            pass  # robot effectors are tracked by the visualizer
+        elif self.station_holder.get(loc) == wafer.id:
+            self.station_holder[loc] = None
+
+    # ---- mutators ----
+
     def add_wafer_in_cassette(self, wafer_id, slot_index) -> Wafer:
+        assert wafer_id not in self.wafers, f"wafer {wafer_id!r} already exists"
+        cassette = self._cassette()
+        assert cassette.slots[slot_index] is None, (
+            f"slot {slot_index} already holds {cassette.slots[slot_index]!r}"
+        )
         wafer = Wafer(id=wafer_id, location=f"Cassette:{slot_index}")
         self.wafers[wafer_id] = wafer
+        cassette.slots[slot_index] = wafer_id
         self.wafer_added.emit(wafer)
         return wafer
 
@@ -270,10 +313,13 @@ class MachineController(QObject):
         station = self.stations.get(destination)
         if wafer is None or station is None:
             return
+        self._release(wafer)
         if isinstance(station, Cassette):
             wafer.location = f"{destination}:0"
+            station.slots[0] = wafer.id
         else:
             wafer.location = destination
+            self.station_holder[destination] = wafer.id
         self.wafer_moved.emit(wafer)
 
     def trigger_load_to_cassette_slot(self, wafer_id, slot_index):
@@ -281,13 +327,16 @@ class MachineController(QObject):
         cassette = self.stations.get("Cassette")
         if wafer is None or not isinstance(cassette, Cassette):
             return
+        self._release(wafer)
         wafer.location = f"Cassette:{slot_index}"
+        cassette.slots[slot_index] = wafer.id
         self.wafer_moved.emit(wafer)
 
     def trigger_park_on_robot(self, wafer_id, effector_index):
         wafer = self.wafers.get(wafer_id)
         if wafer is None:
             return
+        self._release(wafer)
         wafer.location = f"Robot:{effector_index}"
         self.wafer_moved.emit(wafer)
 
@@ -628,18 +677,6 @@ class WaferVisualizer(QGraphicsView):
     # ---- wafer lifecycle ----
 
     def _on_wafer_added(self, wafer: Wafer):
-        # If a graphics item for this id already exists (e.g. the user is
-        # replaying a process that begins with `from_slot`), drop the old
-        # one before creating the new one — otherwise two items render at
-        # the same slot and one stays behind when the robot picks the
-        # other up.
-        old = self.wafer_items.pop(wafer.id, None)
-        if old is not None:
-            for i, occupant in enumerate(self._effector_wafers):
-                if occupant is old:
-                    self._effector_wafers[i] = None
-            self.scene.removeItem(old)
-
         item = WaferItem(wafer)
         item.setZValue(10)
         pos, mode = self._resolve(wafer.location)

@@ -50,16 +50,16 @@ def wait(seconds: float):    return ("wait", seconds)
 class WaferProcess:
     wafer_id: str
     steps: list[tuple]
-    pc: int = 0                                  # next step to execute
-    blocked: bool = False                        # waiting on animation / timer
-    current_station: str | None = None           # station this wafer currently holds
+    pc: int = 0          # next step to execute
+    blocked: bool = False  # waiting on animation / timer
 
 
 class ProcessRunner(QObject):
     """Drives multiple WaferProcesses concurrently.
 
-    Each `to(station)` acquires the named station mutex; the next move
-    releases it. When a station is busy, the process parks until it
+    Station occupancy is owned by `MachineController.station_holder`;
+    this runner only reads it to decide whether the next `to(station)`
+    can proceed. When a station is busy the process parks until it
     frees up. Animation completion (via `WaferVisualizer.wafer_arrived`)
     and `wait()` timers unblock processes — the tick loop then runs any
     steps that are now executable.
@@ -69,7 +69,6 @@ class ProcessRunner(QObject):
         super().__init__(parent)
         self.controller = controller
         self.visualizer = visualizer
-        self.station_holder: dict[str, str | None] = {}
         self.processes: list[WaferProcess] = []
         visualizer.wafer_arrived.connect(self._on_wafer_arrived)
 
@@ -95,28 +94,24 @@ class ProcessRunner(QObject):
         verb, *args = ps.steps[ps.pc]
 
         if verb == "from_slot":
-            self.controller.add_wafer_in_cassette(ps.wafer_id, args[0])
+            # Idempotent on replay: if the wafer already exists, leave it
+            # wherever it is. Otherwise create it at the requested slot.
+            if ps.wafer_id not in self.controller.wafers:
+                self.controller.add_wafer_in_cassette(ps.wafer_id, args[0])
             ps.pc += 1
             return True
 
         if verb == "to":
             station = args[0]
-            holder = self.station_holder.get(station)
+            holder = self.controller.station_holder.get(station)
             if holder not in (None, ps.wafer_id):
-                return False  # blocked on resource
-            if ps.current_station is not None and ps.current_station != station:
-                self.station_holder[ps.current_station] = None
-            self.station_holder[station] = ps.wafer_id
-            ps.current_station = station
+                return False  # blocked on resource — try again next tick
             ps.blocked = True
             ps.pc += 1
             self.controller.trigger_hardware_move(ps.wafer_id, station)
             return True
 
         if verb == "to_slot":
-            if ps.current_station is not None:
-                self.station_holder[ps.current_station] = None
-                ps.current_station = None
             ps.blocked = True
             ps.pc += 1
             self.controller.trigger_load_to_cassette_slot(ps.wafer_id, args[0])
