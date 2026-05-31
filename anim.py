@@ -335,47 +335,30 @@ class MachineController(QObject):
     # ---- mutators ----
 
     def add_wafer_in_cassette(self, wafer_id, slot_index) -> Wafer:
-        assert wafer_id not in self.wafers, f"wafer {wafer_id!r} already exists"
         cassette = self._cassette()
-        assert cassette.slots[slot_index] is None, (
-            f"slot {slot_index} already holds {cassette.slots[slot_index]!r}"
-        )
+        assert wafer_id not in self.wafers and cassette.slots[slot_index] is None
         wafer = Wafer(id=wafer_id, location=Location.slot("Cassette", slot_index))
         self.wafers[wafer_id] = wafer
         cassette.slots[slot_index] = wafer_id
         self.wafer_added.emit(wafer)
         return wafer
 
-    def trigger_hardware_move(self, wafer_id, destination):
-        wafer = self.wafers.get(wafer_id)
-        if wafer is None:
-            return
-        target_location = Location.station(destination) if destination in self.stations else None
-        if target_location:
-            self._move_queue.append((wafer, target_location))
-            if not self._busy:
-                self._process_next()
+    def _enqueue_move(self, wafer_id, location: Location):
+        if wafer := self.wafers.get(wafer_id):
+            self._move_queue.append((wafer, location))
+            if not self._busy: self._process_next()
 
-    def trigger_load_to_cassette_slot(self, wafer_id, slot_index):
-        wafer = self.wafers.get(wafer_id)
-        if wafer is None:
-            return
-        target_location = Location.slot("Cassette", slot_index)
-        self._move_queue.append((wafer, target_location))
-        if not self._busy:
-            self._process_next()
+    def trigger_hardware_move(self, wid, dest):
+        self._enqueue_move(wid, Location.station(dest))
 
-    def trigger_park_on_robot(self, wafer_id, effector_index):
-        wafer = self.wafers.get(wafer_id)
-        if wafer is None:
-            return
-        target_location = Location.effector(effector_index)
-        self._move_queue.append((wafer, target_location))
-        if not self._busy:
-            self._process_next()
+    def trigger_load_to_cassette_slot(self, wid, slot):
+        self._enqueue_move(wid, Location.slot("Cassette", slot))
+
+    def trigger_park_on_robot(self, wid, effector):
+        self._enqueue_move(wid, Location.effector(effector))
 
     def free_effectors(self) -> list[int]:
-        return [i for i, w_id in enumerate(self.robot.effectors) if w_id is None]
+        return [i for i, w in enumerate(self.robot.effectors) if w is None]
 
     # ---- movement choreography ----
 
@@ -383,68 +366,43 @@ class MachineController(QObject):
         if not self._move_queue:
             self._busy = False
             return
-        self._busy = True
-        wafer, target_location = self._move_queue.pop(0)
+        self._busy, (wafer, target) = True, self._move_queue.pop(0)
 
-        # Decide which effector to use.
-        current_effector = next((i for i, w_id in enumerate(self.robot.effectors)
-                                 if w_id == wafer.id), None)
-        
-        if current_effector is not None:
-            # Already on robot, move to target.
-            self._do_drop(wafer, current_effector, target_location)
+        # 1. On robot? Move to target. 2. Free effector? Pickup. 3. Full? Wait.
+        if wafer.id in self.robot.effectors:
+            self._do_move_leg(wafer, self.robot.effectors.index(wafer.id), target, is_pickup=False)
+        elif None in self.robot.effectors:
+            e = self.robot.effectors.index(None)
+            self.robot.effectors[e] = wafer.id
+            self._do_move_leg(wafer, e, target, is_pickup=True)
         else:
-            # Not on robot, must pick up first.
-            target_effector = next((i for i, w_id in enumerate(self.robot.effectors)
-                                   if w_id is None), None)
-            if target_effector is not None:
-                self._do_pickup(wafer, target_effector, target_location)
+            self._move_queue.insert(0, (wafer, target))
+            self._busy = False
+
+    def _do_move_leg(self, wafer, effector, final_target, is_pickup):
+        from PySide6.QtCore import QTimer
+        def done():
+            if is_pickup:
+                self._release(wafer)
+                wafer.location = Location.effector(effector)
+                self.wafer_moved.emit(wafer)
+                if final_target.type == LocationType.EFFECTOR and final_target.index == effector:
+                    self.wafer_arrived.emit(wafer.id)
+                    self._process_next()
+                else:
+                    self._do_move_leg(wafer, effector, final_target, is_pickup=False)
             else:
-                # All effectors full - should not happen if caller checked free_effectors
-                self._busy = False
+                self._release(wafer)
+                wafer.location = final_target
+                if final_target.type == LocationType.SLOT:
+                    self._cassette().slots[final_target.index] = wafer.id
+                elif final_target.type == LocationType.STATION:
+                    self.station_holder[final_target.name] = wafer.id
+                self.wafer_moved.emit(wafer)
+                self.wafer_arrived.emit(wafer.id)
                 self._process_next()
 
-    def _do_pickup(self, wafer, effector, final_target):
-        # 1. Start pickup animation (View listens to wafer_moved to effector)
-        # Note: In a real simulation, we might need a "PICKING_UP" state.
-        # For now, we simulate the reach/grab/retract duration.
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(self.MOVE_STEP_DURATION_MS,
-                          lambda: self._on_pickup_done(wafer, effector, final_target))
-
-    def _on_pickup_done(self, wafer, effector, final_target):
-        self._release(wafer)
-        wafer.location = Location.effector(effector)
-        self.robot.effectors[effector] = wafer.id
-        self.wafer_moved.emit(wafer)
-
-        if final_target.type == LocationType.EFFECTOR and final_target.index == effector:
-            # Move was just to park on this effector.
-            self.wafer_arrived.emit(wafer.id)
-            self._process_next()
-        else:
-            # Continue to destination.
-            self._do_drop(wafer, effector, final_target)
-
-    def _do_drop(self, wafer, effector, target_location):
-        # Simulate reach/release/retract duration.
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(self.MOVE_STEP_DURATION_MS,
-                          lambda: self._on_drop_done(wafer, effector, target_location))
-
-    def _on_drop_done(self, wafer, effector, target_location):
-        self._release(wafer)
-        wafer.location = target_location
-        if target_location.type == LocationType.SLOT:
-            cassette = self.stations.get(target_location.name)
-            if isinstance(cassette, Cassette):
-                cassette.slots[target_location.index] = wafer.id
-        elif target_location.type == LocationType.STATION:
-            self.station_holder[target_location.name] = wafer.id
-        
-        self.wafer_moved.emit(wafer)
-        self.wafer_arrived.emit(wafer.id)
-        self._process_next()
+        QTimer.singleShot(self.MOVE_STEP_DURATION_MS, done)
 
 
 # ---------- VIEW ----------
@@ -539,8 +497,8 @@ class RobotVisual(QObject):
             tip.setZValue(5)
             self.tips.append(tip)
 
-        self._refresh(0)
-        self._refresh(1)
+        for i in range(EFFECTOR_COUNT):
+            self._refresh(i)
 
     def add_to_scene(self, scene: QGraphicsScene):
         for arm in self.arms:
@@ -714,7 +672,7 @@ class WaferVisualizer(QGraphicsView):
         self.laser_visual: LaserVisual | None = None
         self.mask_visual: MaskVisual | None = None
 
-        # _effector_wafers[i] is the WaferItem currently riding effector i (or None).
+        # _effector_wafers[i] is the WaferItem currently riding an effector.
         # Updated only via _attach / _deliver during animation playback.
         self._effector_wafers: list[WaferItem | None] = [None] * EFFECTOR_COUNT
 
@@ -793,6 +751,7 @@ class WaferVisualizer(QGraphicsView):
             # Drop animation.
             effector = next((i for i, occupant in enumerate(self._effector_wafers)
                              if occupant is item), None)
+            
             if effector is not None:
                 seq = QSequentialAnimationGroup(self)
                 item.set_mode(WaferViewMode.TOP_DOWN)
