@@ -628,6 +628,18 @@ class WaferVisualizer(QGraphicsView):
     # ---- wafer lifecycle ----
 
     def _on_wafer_added(self, wafer: Wafer):
+        # If a graphics item for this id already exists (e.g. the user is
+        # replaying a process that begins with `from_slot`), drop the old
+        # one before creating the new one — otherwise two items render at
+        # the same slot and one stays behind when the robot picks the
+        # other up.
+        old = self.wafer_items.pop(wafer.id, None)
+        if old is not None:
+            for i, occupant in enumerate(self._effector_wafers):
+                if occupant is old:
+                    self._effector_wafers[i] = None
+            self.scene.removeItem(old)
+
         item = WaferItem(wafer)
         item.setZValue(10)
         pos, mode = self._resolve(wafer.location)
