@@ -70,7 +70,7 @@ class ProcessRunner(QObject):
         self.controller = controller
         self.visualizer = visualizer
         self.processes: list[WaferProcess] = []
-        visualizer.wafer_arrived.connect(self._on_wafer_arrived)
+        controller.wafer_arrived.connect(self._on_wafer_arrived)
 
     def add(self, wafer_id: str, steps: list[tuple]) -> WaferProcess:
         ps = WaferProcess(wafer_id, list(steps))

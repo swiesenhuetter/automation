@@ -237,6 +237,12 @@ class Cassette(Station):
 class Robot(Station):
     """Dual-effector rotating robot. The body stays at .pos forever."""
     effector_count: int = EFFECTOR_COUNT
+    # effectors[i] is the id of the wafer on effector i, or None.
+    effectors: list[str | None] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.effectors:
+            self.effectors = [None] * self.effector_count
 
 
 @dataclass
@@ -265,6 +271,9 @@ class Wafer:
 class MachineController(QObject):
     wafer_added = Signal(object)
     wafer_moved = Signal(object)
+    wafer_arrived = Signal(str)
+
+    MOVE_STEP_DURATION_MS = 1200  # Pickup/Drop leg duration (3 legs * 400ms)
 
     def __init__(self):
         super().__init__()
@@ -297,6 +306,9 @@ class MachineController(QObject):
         }
         self.wafers: dict[str, Wafer] = {}
 
+        self._move_queue: list[tuple[Wafer, Location]] = []
+        self._busy = False
+
     # ---- model invariants ----
 
     def _cassette(self) -> Cassette:
@@ -314,7 +326,8 @@ class MachineController(QObject):
             if 0 <= loc.index < cassette.slot_count and cassette.slots[loc.index] == wafer.id:
                 cassette.slots[loc.index] = None
         elif loc.type == LocationType.EFFECTOR:
-            pass  # robot effectors are tracked by the visualizer
+            if self.robot.effectors[loc.index] == wafer.id:
+                self.robot.effectors[loc.index] = None
         elif loc.type == LocationType.STATION:
             if self.station_holder.get(loc.name) == wafer.id:
                 self.station_holder[loc.name] = None
@@ -335,43 +348,103 @@ class MachineController(QObject):
 
     def trigger_hardware_move(self, wafer_id, destination):
         wafer = self.wafers.get(wafer_id)
-        station = self.stations.get(destination)
-        if wafer is None or station is None:
+        if wafer is None:
             return
-        self._release(wafer)
-        if isinstance(station, Cassette):
-            wafer.location = Location.slot(destination, 0)
-            station.slots[0] = wafer.id
-        else:
-            wafer.location = Location.station(destination)
-            self.station_holder[destination] = wafer.id
-        self.wafer_moved.emit(wafer)
+        target_location = Location.station(destination) if destination in self.stations else None
+        if target_location:
+            self._move_queue.append((wafer, target_location))
+            if not self._busy:
+                self._process_next()
 
     def trigger_load_to_cassette_slot(self, wafer_id, slot_index):
         wafer = self.wafers.get(wafer_id)
-        cassette = self.stations.get("Cassette")
-        if wafer is None or not isinstance(cassette, Cassette):
+        if wafer is None:
             return
-        self._release(wafer)
-        wafer.location = Location.slot("Cassette", slot_index)
-        cassette.slots[slot_index] = wafer.id
-        self.wafer_moved.emit(wafer)
+        target_location = Location.slot("Cassette", slot_index)
+        self._move_queue.append((wafer, target_location))
+        if not self._busy:
+            self._process_next()
 
     def trigger_park_on_robot(self, wafer_id, effector_index):
         wafer = self.wafers.get(wafer_id)
         if wafer is None:
             return
-        self._release(wafer)
-        wafer.location = Location.effector(effector_index)
-        self.wafer_moved.emit(wafer)
+        target_location = Location.effector(effector_index)
+        self._move_queue.append((wafer, target_location))
+        if not self._busy:
+            self._process_next()
 
     def free_effectors(self) -> list[int]:
-        occupied = {
-            w.location.index
-            for w in self.wafers.values()
-            if w.location and w.location.type == LocationType.EFFECTOR
-        }
-        return [i for i in range(EFFECTOR_COUNT) if i not in occupied]
+        return [i for i, w_id in enumerate(self.robot.effectors) if w_id is None]
+
+    # ---- movement choreography ----
+
+    def _process_next(self):
+        if not self._move_queue:
+            self._busy = False
+            return
+        self._busy = True
+        wafer, target_location = self._move_queue.pop(0)
+
+        # Decide which effector to use.
+        current_effector = next((i for i, w_id in enumerate(self.robot.effectors)
+                                 if w_id == wafer.id), None)
+        
+        if current_effector is not None:
+            # Already on robot, move to target.
+            self._do_drop(wafer, current_effector, target_location)
+        else:
+            # Not on robot, must pick up first.
+            target_effector = next((i for i, w_id in enumerate(self.robot.effectors)
+                                   if w_id is None), None)
+            if target_effector is not None:
+                self._do_pickup(wafer, target_effector, target_location)
+            else:
+                # All effectors full - should not happen if caller checked free_effectors
+                self._busy = False
+                self._process_next()
+
+    def _do_pickup(self, wafer, effector, final_target):
+        # 1. Start pickup animation (View listens to wafer_moved to effector)
+        # Note: In a real simulation, we might need a "PICKING_UP" state.
+        # For now, we simulate the reach/grab/retract duration.
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(self.MOVE_STEP_DURATION_MS,
+                          lambda: self._on_pickup_done(wafer, effector, final_target))
+
+    def _on_pickup_done(self, wafer, effector, final_target):
+        self._release(wafer)
+        wafer.location = Location.effector(effector)
+        self.robot.effectors[effector] = wafer.id
+        self.wafer_moved.emit(wafer)
+
+        if final_target.type == LocationType.EFFECTOR and final_target.index == effector:
+            # Move was just to park on this effector.
+            self.wafer_arrived.emit(wafer.id)
+            self._process_next()
+        else:
+            # Continue to destination.
+            self._do_drop(wafer, effector, final_target)
+
+    def _do_drop(self, wafer, effector, target_location):
+        # Simulate reach/release/retract duration.
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(self.MOVE_STEP_DURATION_MS,
+                          lambda: self._on_drop_done(wafer, effector, target_location))
+
+    def _on_drop_done(self, wafer, effector, target_location):
+        self._release(wafer)
+        wafer.location = target_location
+        if target_location.type == LocationType.SLOT:
+            cassette = self.stations.get(target_location.name)
+            if isinstance(cassette, Cassette):
+                cassette.slots[target_location.index] = wafer.id
+        elif target_location.type == LocationType.STATION:
+            self.station_holder[target_location.name] = wafer.id
+        
+        self.wafer_moved.emit(wafer)
+        self.wafer_arrived.emit(wafer.id)
+        self._process_next()
 
 
 # ---------- VIEW ----------
@@ -631,11 +704,6 @@ class MaskVisual:
 class WaferVisualizer(QGraphicsView):
     LEG_DURATION_MS = 400   # rotate / extend / retract: ~6 legs per move
 
-    # Fired after a queued move animation has fully finished. The
-    # ProcessRunner uses this to advance per-wafer processes once their
-    # current move is done.
-    wafer_arrived = Signal(str)
-
     def __init__(self, controller: MachineController):
         super().__init__()
         self.controller = controller
@@ -647,14 +715,8 @@ class WaferVisualizer(QGraphicsView):
         self.mask_visual: MaskVisual | None = None
 
         # _effector_wafers[i] is the WaferItem currently riding effector i (or None).
-        # Updated only via _attach / _detach during animation playback.
+        # Updated only via _attach / _deliver during animation playback.
         self._effector_wafers: list[WaferItem | None] = [None] * EFFECTOR_COUNT
-
-        # Robot serves one move at a time. Snapshot target location at queue time.
-        self._move_queue: list[tuple[Wafer, Location]] = []
-        self._busy = False
-        self._current_seq: QSequentialAnimationGroup | None = None
-        self._current_wafer: Wafer | None = None
 
         self._draw_static_scene()
         controller.wafer_added.connect(self._on_wafer_added)
@@ -712,56 +774,39 @@ class WaferVisualizer(QGraphicsView):
         self.wafer_items[wafer.id] = item
 
     def _on_wafer_moved(self, wafer: Wafer):
-        self._move_queue.append((wafer, wafer.location))
-        if not self._busy:
-            self._process_next()
-
-    # ---- choreography ----
-
-    def _process_next(self):
-        if not self._move_queue or self.robot is None:
-            self._busy = False
-            return
-        wafer, target_location = self._move_queue.pop(0)
+        """React to a logical move by triggering a visual animation."""
         item = self.wafer_items.get(wafer.id)
-        if item is None:
-            self._process_next()
+        if not item or not self.robot:
             return
 
-        source_effector = self._find_carrying_effector(item)
-        target_effector = self._pick_effector(item, target_location, source_effector)
-        if target_effector is None:
-            # Either no free effector for pickup, or destination effector is busy.
-            self._busy = False
-            self._process_next()
-            return
-
-        self._busy = True
-        target_pos, target_mode = self._resolve(target_location)
-        item.set_mode(WaferViewMode.TOP_DOWN)
-
-        seq = QSequentialAnimationGroup(self)
-
-        # ---- pickup phase (only if wafer is not already on the robot) ----
-        if source_effector is None:
-            pickup_pos = item.get_pos()
-            self._add_reach_legs(seq, target_effector, pickup_pos,
-                                 on_arrived=lambda: self._attach(item, target_effector))
-
-        # ---- drop phase (only if destination is a station, not the robot) ----
-        if target_location.type != LocationType.EFFECTOR:
-            self._add_reach_legs(seq, target_effector, target_pos,
-                                 on_arrived=lambda: self._deliver(item, target_mode, target_effector))
-
-        seq.finished.connect(self._on_sequence_done)
-        self._current_seq = seq
-        self._current_wafer = wafer
-        seq.start()
+        target_pos, target_mode = self._resolve(wafer.location)
+        
+        # Determine if this is a pickup (moving to effector) or a drop (moving from effector).
+        if wafer.location.type == LocationType.EFFECTOR:
+            # Pickup animation.
+            effector = wafer.location.index
+            seq = QSequentialAnimationGroup(self)
+            self._add_reach_legs(seq, effector, target_pos,
+                                 on_arrived=lambda: self._attach(item, effector))
+            seq.start()
+        else:
+            # Drop animation.
+            effector = next((i for i, occupant in enumerate(self._effector_wafers)
+                             if occupant is item), None)
+            if effector is not None:
+                seq = QSequentialAnimationGroup(self)
+                item.set_mode(WaferViewMode.TOP_DOWN)
+                self._add_reach_legs(seq, effector, target_pos,
+                                     on_arrived=lambda: self._deliver(item, target_mode, effector))
+                seq.start()
+            else:
+                # Teleport if not on robot (e.g. initialization or error recovery)
+                item.set_pos(target_pos)
+                item.set_mode(target_mode)
 
     def _add_reach_legs(self, seq: QSequentialAnimationGroup, effector: int,
                         target_pos: QPointF, on_arrived):
-        """Append three legs: rotate-to-face, extend-to-target, retract-to-rest.
-        ``on_arrived`` fires between the extend and the retract (i.e. at the apex)."""
+        """Append three legs: rotate-to-face, extend-to-target, retract-to-rest."""
         assert self.robot is not None
         target_rotation = self.robot.rotation_for_effector_facing(effector, target_pos)
         target_rotation = shortest_rotation_target(self.robot.get_rotation_deg(), target_rotation)
@@ -788,33 +833,6 @@ class WaferVisualizer(QGraphicsView):
     def _ext_prop(effector: int) -> bytes:
         return b"extension_0" if effector == 0 else b"extension_1"
 
-    # ---- effector bookkeeping ----
-
-    def _find_carrying_effector(self, item: WaferItem) -> int | None:
-        for i, occupant in enumerate(self._effector_wafers):
-            if occupant is item:
-                return i
-        return None
-
-    def _pick_effector(self, item: WaferItem, target_location: Location,
-                       source_effector: int | None) -> int | None:
-        """Return the effector to use for this move, or None if not feasible."""
-        if target_location.type == LocationType.EFFECTOR:
-            dest_e = target_location.index
-            if source_effector is not None and source_effector != dest_e:
-                return None  # can't move between effectors (they share rotation)
-            if source_effector is None and self._effector_wafers[dest_e] is not None:
-                return None  # destination effector occupied
-            return dest_e
-        # Destination is a regular station / cassette slot.
-        if source_effector is not None:
-            return source_effector
-        # Pick first free effector.
-        for i, occupant in enumerate(self._effector_wafers):
-            if occupant is None:
-                return i
-        return None
-
     def _attach(self, item: WaferItem, effector: int):
         sig = self.robot.tip_0_moved if effector == 0 else self.robot.tip_1_moved
         sig.connect(item.set_pos)
@@ -828,14 +846,6 @@ class WaferVisualizer(QGraphicsView):
             pass
         self._effector_wafers[effector] = None
         item.set_mode(target_mode)
-
-    def _on_sequence_done(self):
-        finished_wafer = self._current_wafer
-        self._current_seq = None
-        self._current_wafer = None
-        if finished_wafer is not None:
-            self.wafer_arrived.emit(finished_wafer.id)
-        self._process_next()
 
     # ---- location resolution ----
 
