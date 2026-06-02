@@ -105,6 +105,7 @@ class Theme:
     robot_arm: QColor
     robot_tip_fill: QColor
     robot_tip_outline: QColor
+    robot_tip_text: QColor
     # Laser
     laser_body_fill: QColor
     laser_body_outline: QColor
@@ -129,6 +130,7 @@ LIGHT_THEME = Theme(
     robot_arm=GRAY_555,
     robot_tip_fill=GRAY_333,
     robot_tip_outline=BLACK,
+    robot_tip_text=WHITE,
     laser_body_fill=GRAY_444,
     laser_body_outline=BLACK,
     laser_beam=BEAM_RED,
@@ -152,6 +154,7 @@ DARK_THEME = Theme(
     robot_arm=GRAY_999,
     robot_tip_fill=GRAY_DDD,
     robot_tip_outline=NEAR_BLACK,
+    robot_tip_text=NEAR_BLACK,
     laser_body_fill=GRAY_CCC,
     laser_body_outline=NEAR_BLACK,
     laser_beam=BEAM_RED_BRIGHT,
@@ -250,7 +253,8 @@ class RobotVisual(QObject):
 
         self.arms = []
         self.tips = []
-        for _ in range(EFFECTOR_COUNT):
+        self.tip_labels = []
+        for i in range(EFFECTOR_COUNT):
             arm = QGraphicsLineItem()
             pen = QPen(THEME.robot_arm, self.ARM_THICKNESS)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -265,6 +269,14 @@ class RobotVisual(QObject):
             tip.setZValue(5)
             self.tips.append(tip)
 
+            # Effector number, displayed 1-based. Sits above the tip but
+            # below any wafer (z=10), so it shows on an empty effector.
+            label = QGraphicsTextItem(str(i + 1))
+            label.setFont(LABEL_FONT)
+            label.setDefaultTextColor(THEME.robot_tip_text)
+            label.setZValue(6)
+            self.tip_labels.append(label)
+
         self._refresh(0)
         self._refresh(1)
 
@@ -274,6 +286,8 @@ class RobotVisual(QObject):
         scene.addItem(self.body)
         for tip in self.tips:
             scene.addItem(tip)
+        for label in self.tip_labels:
+            scene.addItem(label)
 
     def effector_angle_deg(self, effector_index: int) -> float:
         return self._rotation_deg + effector_index * 180.0
@@ -302,6 +316,9 @@ class RobotVisual(QObject):
         self.tips[effector_index].setPos(tip)
         self.arms[effector_index].setLine(self.home_pos.x(), self.home_pos.y(),
                                           tip.x(), tip.y())
+        label = self.tip_labels[effector_index]
+        br = label.boundingRect()
+        label.setPos(tip.x() - br.width() / 2, tip.y() - br.height() / 2)
         (self.tip_0_moved if effector_index == 0 else self.tip_1_moved).emit(tip)
 
     # --- Animatable properties ---
