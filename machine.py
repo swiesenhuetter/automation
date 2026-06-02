@@ -96,6 +96,15 @@ class Cassette(Station):
 class Robot(Station):
     """Dual-effector rotating robot. The body stays at .pos forever."""
     effector_count: int = EFFECTOR_COUNT
+    # `effectors[i]` is the wafer id parked on effector i, or None. This
+    # tracks *parked* occupancy only (wafers whose location is EFFECTOR).
+    # In-flight carry during a station->station move is still owned by the
+    # visualizer until moves become time-aware in the model (step 3).
+    effectors: list[str | None] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.effectors:
+            self.effectors = [None] * self.effector_count
 
 
 @dataclass
@@ -173,7 +182,8 @@ class MachineController(QObject):
             if 0 <= loc.index < cassette.slot_count and cassette.slots[loc.index] == wafer.id:
                 cassette.slots[loc.index] = None
         elif loc.type == LocationType.EFFECTOR:
-            pass  # robot effectors are tracked by the visualizer
+            if 0 <= loc.index < len(self.robot.effectors) and self.robot.effectors[loc.index] == wafer.id:
+                self.robot.effectors[loc.index] = None
         elif loc.type == LocationType.STATION:
             if self.station_holder.get(loc.name) == wafer.id:
                 self.station_holder[loc.name] = None
@@ -222,12 +232,8 @@ class MachineController(QObject):
             return
         self._release(wafer)
         wafer.location = Location.effector(effector_index)
+        self.robot.effectors[effector_index] = wafer.id
         self.wafer_moved.emit(wafer)
 
     def free_effectors(self) -> list[int]:
-        occupied = {
-            w.location.index
-            for w in self.wafers.values()
-            if w.location and w.location.type == LocationType.EFFECTOR
-        }
-        return [i for i in range(EFFECTOR_COUNT) if i not in occupied]
+        return [i for i, w in enumerate(self.robot.effectors) if w is None]
