@@ -3,7 +3,7 @@
 `anim.py` is the reusable machine widget (model + visuals + visualizer).
 This file is the thin demo layer that drives it:
 
-* the small process DSL (`from_slot`, `to`, `laser`, `wait`, …),
+* the small process DSL (`from_slot`, `to`, `expose`, `wait`, …),
 * `ProcessRunner` — schedules multiple wafer processes concurrently,
   treating each station as a mutex,
 * `MainWindow` — the action-button UI used to play with the widget by
@@ -30,8 +30,8 @@ from anim import WaferVisualizer
 # A wafer process is a flat list of (verb, *args) tuples. Each process is
 # scoped to a single wafer; multiple processes run concurrently and
 # coordinate by treating each station as a mutex — the runner blocks a
-# `to(station)` step until that station is free. Global verbs
-# (`laser`, `wait`) ignore wafer identity.
+# `to(station)` step until that station is free. Time-based verbs
+# (`expose`, `wait`) hold their process for a duration without moving a wafer.
 
 # Verb factories — return the same tuples a user could write by hand,
 # but with IDE autocomplete + type checks for cheap typo-safety.
@@ -39,8 +39,26 @@ from anim import WaferVisualizer
 def from_slot(n: int):       return ("from_slot", n)
 def to(station: str):        return ("to", station)
 def to_slot(n: int):         return ("to_slot", n)
-def laser(on: bool):         return ("laser", on)
 def wait(seconds: float):    return ("wait", seconds)
+
+
+@dataclass(frozen=True)
+class Exposure:
+    """Parameters for one `expose` step — the seed of the process recipe.
+
+    Only `seconds` is wired up today; `dose`/`intensity` are stubs for the real
+    recipe. They are physically linked (dose ~= intensity * time), so once any
+    two are given the third can be derived/validated here rather than at the
+    call site.
+    """
+    seconds: float
+    dose: float | None = None        # target dose (mJ/cm^2) — future
+    intensity: float | None = None   # laser intensity        — future
+
+
+def expose(seconds: float, *, dose: float | None = None,
+           intensity: float | None = None):
+    return ("expose", Exposure(seconds, dose=dose, intensity=intensity))
 
 
 @dataclass
@@ -114,9 +132,16 @@ class ProcessRunner(QObject):
             self.controller.request_load(ps.wafer_id, args[0])
             return True
 
-        if verb == "laser":
-            self.visualizer.set_laser(bool(args[0]))
+        if verb == "expose":
+            exposure = args[0]
+            ps.blocked = True
             ps.pc += 1
+            # Beam on -> dwell -> beam off. Exposure owns real time without an
+            # animation behind it, so it keeps a lone timer (the step-3 `wait`
+            # exception). Only `seconds` is honoured for now.
+            self.visualizer.set_laser(True)
+            QTimer.singleShot(int(exposure.seconds * 1000),
+                              lambda p=ps: self._end_exposure(p))
             return True
 
         if verb == "wait":
@@ -133,6 +158,10 @@ class ProcessRunner(QObject):
                 ps.blocked = False
                 break
         self._tick()
+
+    def _end_exposure(self, ps: WaferProcess):
+        self.visualizer.set_laser(False)
+        self._unblock(ps)
 
     def _unblock(self, ps: WaferProcess):
         ps.blocked = False
@@ -234,18 +263,14 @@ class MainWindow(QMainWindow):
             from_slot(10),
             to("Aligner"),
             to("Exposure Box"),
-            laser(True),
-            wait(4.5),
-            laser(False),
+            expose(4.5),
             to_slot(10),
         ])
         self.runner.add("W_Y", [
             from_slot(11),
             to("Aligner"),
             to("Exposure Box"),
-            laser(True),
-            wait(4.0),
-            laser(False),
+            expose(4.0),
             to_slot(11),
         ])
 
