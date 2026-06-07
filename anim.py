@@ -14,12 +14,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QBrush, QColor, QFont, QPen, QPolygonF
 
 from machine import (
-    CASSETTE_SLOT_COUNT, EFFECTOR_COUNT,
-    EXPOSURE_POS, EXPOSURE_SIZE, CASSETTE_POS, CASSETTE_SIZE,
-    ALIGNER_POS, ALIGNER_SIZE, ROBOT_POS, ROBOT_SIZE,
-    LASER_Y, MASK_HEIGHT, MASK_GAP,
+    EFFECTOR_COUNT,
     LocationType, Location,
-    Station, Cassette, Robot, Laser, Mask, Wafer,
+    Cassette, Wafer, Move,
     MachineController,
 )
 
@@ -445,13 +442,6 @@ class MaskVisual:
 
 
 class WaferVisualizer(QGraphicsView):
-    LEG_DURATION_MS = 400   # rotate / extend / retract: ~6 legs per move
-
-    # Fired after a queued move animation has fully finished. The
-    # ProcessRunner uses this to advance per-wafer processes once their
-    # current move is done.
-    wafer_arrived = Signal(str)
-
     def __init__(self, controller: MachineController):
         super().__init__()
         self.controller = controller
@@ -463,18 +453,18 @@ class WaferVisualizer(QGraphicsView):
         self.mask_visual: MaskVisual | None = None
 
         # _effector_wafers[i] is the WaferItem currently riding effector i (or None).
-        # Updated only via _attach / _detach during animation playback.
+        # Updated only via _attach / _deliver during animation playback. Effector
+        # allocation stays view-side until step 3b moves it into the model.
         self._effector_wafers: list[WaferItem | None] = [None] * EFFECTOR_COUNT
 
-        # Robot serves one move at a time. Snapshot target location at queue time.
-        self._move_queue: list[tuple[Wafer, Location]] = []
-        self._busy = False
+        # The model owns the move queue; the view renders one active move at a
+        # time and reports completion back via controller.complete_move.
         self._current_seq: QSequentialAnimationGroup | None = None
-        self._current_wafer: Wafer | None = None
+        self._current_move: Move | None = None
 
         self._draw_static_scene()
         controller.wafer_added.connect(self._on_wafer_added)
-        controller.wafer_moved.connect(self._on_wafer_moved)
+        controller.move_started.connect(self._on_move_started)
 
     # ---- static drawing ----
 
@@ -527,33 +517,25 @@ class WaferVisualizer(QGraphicsView):
         self.scene.addItem(item)
         self.wafer_items[wafer.id] = item
 
-    def _on_wafer_moved(self, wafer: Wafer):
-        self._move_queue.append((wafer, wafer.location))
-        if not self._busy:
-            self._process_next()
-
     # ---- choreography ----
 
-    def _process_next(self):
-        if not self._move_queue or self.robot is None:
-            self._busy = False
-            return
-        wafer, target_location = self._move_queue.pop(0)
-        item = self.wafer_items.get(wafer.id)
+    def _on_move_started(self, move: Move):
+        """Render the model's active move; report back via complete_move when done."""
+        item = self.wafer_items.get(move.wafer_id) if self.robot is not None else None
         if item is None:
-            self._process_next()
+            self.controller.complete_move(move.id)
             return
 
         source_effector = self._find_carrying_effector(item)
-        target_effector = self._pick_effector(item, target_location, source_effector)
+        target_effector = self._pick_effector(item, move.dest, source_effector)
         if target_effector is None:
-            # Either no free effector for pickup, or destination effector is busy.
-            self._busy = False
-            self._process_next()
+            # No feasible effector. Occupancy was already reserved at request
+            # time, so just report completion to keep the model queue moving.
+            # (Unreachable in the demo; the model owns allocation from step 3b.)
+            self.controller.complete_move(move.id)
             return
 
-        self._busy = True
-        target_pos, target_mode = self._resolve(target_location)
+        target_pos, target_mode = self._resolve(move.dest)
         item.set_mode(WaferViewMode.TOP_DOWN)
 
         seq = QSequentialAnimationGroup(self)
@@ -561,21 +543,27 @@ class WaferVisualizer(QGraphicsView):
         # ---- pickup phase (only if wafer is not already on the robot) ----
         if source_effector is None:
             pickup_pos = item.get_pos()
-            self._add_reach_legs(seq, target_effector, pickup_pos,
+            self._add_reach_legs(seq, target_effector, pickup_pos, move.leg_duration_ms,
                                  on_arrived=lambda: self._attach(item, target_effector))
 
         # ---- drop phase (only if destination is a station, not the robot) ----
-        if target_location.type != LocationType.EFFECTOR:
-            self._add_reach_legs(seq, target_effector, target_pos,
+        if move.dest.type != LocationType.EFFECTOR:
+            self._add_reach_legs(seq, target_effector, target_pos, move.leg_duration_ms,
                                  on_arrived=lambda: self._deliver(item, target_mode, target_effector))
+
+        if seq.animationCount() == 0:
+            # Degenerate move (wafer already on the target effector) — nothing
+            # to play; report completion immediately.
+            self.controller.complete_move(move.id)
+            return
 
         seq.finished.connect(self._on_sequence_done)
         self._current_seq = seq
-        self._current_wafer = wafer
+        self._current_move = move
         seq.start()
 
     def _add_reach_legs(self, seq: QSequentialAnimationGroup, effector: int,
-                        target_pos: QPointF, on_arrived):
+                        target_pos: QPointF, leg_duration_ms: int, on_arrived):
         """Append three legs: rotate-to-face, extend-to-target, retract-to-rest.
         ``on_arrived`` fires between the extend and the retract (i.e. at the apex)."""
         assert self.robot is not None
@@ -583,9 +571,9 @@ class WaferVisualizer(QGraphicsView):
         target_rotation = shortest_rotation_target(self.robot.get_rotation_deg(), target_rotation)
         target_extension = self.robot.distance_to(target_pos)
 
-        rotate = self._anim(b"rotation_deg", target_rotation)
-        extend = self._anim(self._ext_prop(effector), target_extension)
-        retract = self._anim(self._ext_prop(effector), REST_EXTENSION)
+        rotate = self._anim(b"rotation_deg", target_rotation, leg_duration_ms)
+        extend = self._anim(self._ext_prop(effector), target_extension, leg_duration_ms)
+        retract = self._anim(self._ext_prop(effector), REST_EXTENSION, leg_duration_ms)
 
         seq.addAnimation(rotate)
         seq.addAnimation(extend)
@@ -593,9 +581,9 @@ class WaferVisualizer(QGraphicsView):
 
         extend.finished.connect(on_arrived)
 
-    def _anim(self, prop_name: bytes, end_value) -> QPropertyAnimation:
+    def _anim(self, prop_name: bytes, end_value, duration_ms: int) -> QPropertyAnimation:
         anim = QPropertyAnimation(self.robot, prop_name)
-        anim.setDuration(self.LEG_DURATION_MS)
+        anim.setDuration(duration_ms)
         anim.setEasingCurve(QEasingCurve.InOutQuad)
         anim.setEndValue(end_value)
         return anim
@@ -646,12 +634,11 @@ class WaferVisualizer(QGraphicsView):
         item.set_mode(target_mode)
 
     def _on_sequence_done(self):
-        finished_wafer = self._current_wafer
+        move = self._current_move
         self._current_seq = None
-        self._current_wafer = None
-        if finished_wafer is not None:
-            self.wafer_arrived.emit(finished_wafer.id)
-        self._process_next()
+        self._current_move = None
+        if move is not None:
+            self.controller.complete_move(move.id)
 
     # ---- location resolution ----
 

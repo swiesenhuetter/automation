@@ -19,6 +19,7 @@ from PySide6.QtCore import QObject, Signal, QPointF
 
 CASSETTE_SLOT_COUNT = 25
 EFFECTOR_COUNT = 2
+LEG_DURATION_MS = 300   # rotate / extend / retract pacing — one leg of robot motion
 
 
 # ---------- LAYOUT (physical machine placement) ----------
@@ -130,9 +131,29 @@ class Wafer:
     location: Location | None = None
 
 
+@dataclass
+class Move:
+    """One queued robot operation: carry ``wafer_id`` from ``source`` to ``dest``.
+
+    The model owns the queue and the motion time-scale (``leg_duration_ms``); it
+    does *not* schedule completion. The view animates the move and calls
+    ``complete_move`` when its animation finishes (design 2 — the animation is
+    the clock). Occupancy is reserved synchronously at request time, so this
+    object only carries what the view needs to render and report back.
+    """
+    id: int
+    wafer_id: str
+    source: Location | None
+    dest: Location
+    leg_duration_ms: int = LEG_DURATION_MS
+
+
 class MachineController(QObject):
     wafer_added = Signal(object)
-    wafer_moved = Signal(object)
+    # A move was dequeued and begins now — the view animates it.
+    move_started = Signal(object)
+    # The active move's animation finished — the runner advances on this.
+    move_completed = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -164,6 +185,13 @@ class MachineController(QObject):
             name: None for name, st in self.stations.items() if not isinstance(st, Cassette)
         }
         self.wafers: dict[str, Wafer] = {}
+
+        # Robot serves one move at a time. The model owns the queue and the
+        # currently-active move; it does not schedule completion — the view's
+        # animation drives `complete_move` (see Move).
+        self._pending: list[Move] = []
+        self._active: Move | None = None
+        self._move_seq = 0
 
     # ---- model invariants ----
 
@@ -202,38 +230,73 @@ class MachineController(QObject):
         self.wafer_added.emit(wafer)
         return wafer
 
-    def trigger_hardware_move(self, wafer_id, destination):
+    # Requests reserve occupancy synchronously (preserving the runner's mutex
+    # timing) and enqueue a Move. Completion is driven later by the view's
+    # animation via `complete_move` — the model schedules nothing.
+
+    def request_move(self, wafer_id, destination) -> "Move | None":
         wafer = self.wafers.get(wafer_id)
         station = self.stations.get(destination)
         if wafer is None or station is None:
-            return
+            return None
+        source = wafer.location
         self._release(wafer)
         if isinstance(station, Cassette):
-            wafer.location = Location.slot(destination, 0)
+            dest = Location.slot(destination, 0)
             station.slots[0] = wafer.id
         else:
-            wafer.location = Location.station(destination)
+            dest = Location.station(destination)
             self.station_holder[destination] = wafer.id
-        self.wafer_moved.emit(wafer)
+        wafer.location = dest
+        return self._enqueue_move(wafer, source, dest)
 
-    def trigger_load_to_cassette_slot(self, wafer_id, slot_index):
+    def request_load(self, wafer_id, slot_index) -> "Move | None":
         wafer = self.wafers.get(wafer_id)
         cassette = self.stations.get("Cassette")
         if wafer is None or not isinstance(cassette, Cassette):
-            return
+            return None
+        source = wafer.location
         self._release(wafer)
-        wafer.location = Location.slot("Cassette", slot_index)
+        dest = Location.slot("Cassette", slot_index)
         cassette.slots[slot_index] = wafer.id
-        self.wafer_moved.emit(wafer)
+        wafer.location = dest
+        return self._enqueue_move(wafer, source, dest)
 
-    def trigger_park_on_robot(self, wafer_id, effector_index):
+    def request_park(self, wafer_id, effector_index) -> "Move | None":
         wafer = self.wafers.get(wafer_id)
         if wafer is None:
-            return
+            return None
+        source = wafer.location
         self._release(wafer)
-        wafer.location = Location.effector(effector_index)
+        dest = Location.effector(effector_index)
         self.robot.effectors[effector_index] = wafer.id
-        self.wafer_moved.emit(wafer)
+        wafer.location = dest
+        return self._enqueue_move(wafer, source, dest)
 
     def free_effectors(self) -> list[int]:
         return [i for i, w in enumerate(self.robot.effectors) if w is None]
+
+    # ---- move queue (single-robot sequencing) ----
+
+    def _enqueue_move(self, wafer: Wafer, source: Location | None, dest: Location) -> Move:
+        self._move_seq += 1
+        move = Move(self._move_seq, wafer.id, source, dest)
+        self._pending.append(move)
+        self._pump()
+        return move
+
+    def _pump(self):
+        """Start the next move if the robot is idle."""
+        if self._active is not None or not self._pending:
+            return
+        self._active = self._pending.pop(0)
+        self.move_started.emit(self._active)
+
+    def complete_move(self, move_id: int):
+        """Called by the view when the active move's animation finishes."""
+        if self._active is None or self._active.id != move_id:
+            return
+        move = self._active
+        self._active = None
+        self.move_completed.emit(move)
+        self._pump()

@@ -21,11 +21,8 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from anim import (
-    CASSETTE_SLOT_COUNT,
-    MachineController,
-    WaferVisualizer,
-)
+from machine import CASSETTE_SLOT_COUNT, MachineController
+from anim import WaferVisualizer
 
 
 # ---------- PROCESS DSL ----------
@@ -60,7 +57,7 @@ class ProcessRunner(QObject):
     Station occupancy is owned by `MachineController.station_holder`;
     this runner only reads it to decide whether the next `to(station)`
     can proceed. When a station is busy the process parks until it
-    frees up. Animation completion (via `WaferVisualizer.wafer_arrived`)
+    frees up. Move completion (via `MachineController.move_completed`)
     and `wait()` timers unblock processes — the tick loop then runs any
     steps that are now executable.
     """
@@ -70,7 +67,7 @@ class ProcessRunner(QObject):
         self.controller = controller
         self.visualizer = visualizer
         self.processes: list[WaferProcess] = []
-        visualizer.wafer_arrived.connect(self._on_wafer_arrived)
+        controller.move_completed.connect(self._on_move_completed)
 
     def add(self, wafer_id: str, steps: list[tuple]) -> WaferProcess:
         ps = WaferProcess(wafer_id, list(steps))
@@ -108,13 +105,13 @@ class ProcessRunner(QObject):
                 return False  # blocked on resource — try again next tick
             ps.blocked = True
             ps.pc += 1
-            self.controller.trigger_hardware_move(ps.wafer_id, station)
+            self.controller.request_move(ps.wafer_id, station)
             return True
 
         if verb == "to_slot":
             ps.blocked = True
             ps.pc += 1
-            self.controller.trigger_load_to_cassette_slot(ps.wafer_id, args[0])
+            self.controller.request_load(ps.wafer_id, args[0])
             return True
 
         if verb == "laser":
@@ -130,9 +127,9 @@ class ProcessRunner(QObject):
 
         raise ValueError(f"Unknown verb: {verb!r}")
 
-    def _on_wafer_arrived(self, wafer_id: str):
+    def _on_move_completed(self, move):
         for ps in self.processes:
-            if ps.wafer_id == wafer_id and ps.blocked:
+            if ps.wafer_id == move.wafer_id and ps.blocked:
                 ps.blocked = False
                 break
         self._tick()
@@ -151,19 +148,22 @@ class MainWindow(QMainWindow):
         self.visualizer = WaferVisualizer(self.machine)
         self.runner = ProcessRunner(self.machine, self.visualizer)
 
-        for i, wid in enumerate(["W_A", "W_B", "W_C", "W_D"]):
-            self.machine.add_wafer_in_cassette(wid, i)
-
         layout = QVBoxLayout()
         layout.addWidget(self.visualizer)
 
         selector_row = QHBoxLayout()
         selector_row.addWidget(QLabel("Wafer:"))
         self.wafer_combo = QComboBox()
-        for wid in self.machine.wafers:
-            self.wafer_combo.addItem(wid)
+        # Keep the picker in sync with the model: every wafer ever added shows
+        # up here, including ones created lazily by a process's from_slot step.
+        self.machine.wafer_added.connect(lambda w: self.wafer_combo.addItem(w.id))
         selector_row.addWidget(self.wafer_combo)
         layout.addLayout(selector_row)
+
+        # Seed the initial cassette load now that both the visualizer and the
+        # combo are listening on wafer_added.
+        for i, wid in enumerate(["W_A", "W_B", "W_C", "W_D"]):
+            self.machine.add_wafer_in_cassette(wid, i)
 
         for label, dest in [("Move to Aligner", "Aligner"),
                             ("Move to Exposure", "Exposure Box")]:
@@ -211,17 +211,17 @@ class MainWindow(QMainWindow):
         return self.wafer_combo.currentText()
 
     def _move(self, destination: str):
-        self.machine.trigger_hardware_move(self._selected_wafer_id(), destination)
+        self.machine.request_move(self._selected_wafer_id(), destination)
 
     def _park_in_cassette(self):
-        self.machine.trigger_load_to_cassette_slot(self._selected_wafer_id(), self.slot_spin.value())
+        self.machine.request_load(self._selected_wafer_id(), self.slot_spin.value())
 
     def _park_on_robot(self):
         free = self.machine.free_effectors()
         if not free:
             print("Robot is full")
             return
-        self.machine.trigger_park_on_robot(self._selected_wafer_id(), free[0])
+        self.machine.request_park(self._selected_wafer_id(), free[0])
 
     def _toggle_mask(self, loaded: bool):
         self.visualizer.set_mask_loaded(loaded, self.mask_id_edit.text())
